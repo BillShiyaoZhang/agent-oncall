@@ -1,0 +1,72 @@
+syntax = "proto3";
+
+package agent_oncall.v1;
+
+// 统一的外部通信封套
+message OnCallEnvelope {
+  string version = 1;          // 协议版本 (e.g., "1.0.0")
+  int64 timestamp = 2;         // 发送时间戳 (防止重放攻击)
+  string signature = 3;        // 发送方对其 Payload 签名的十六进制串
+  
+  oneof payload {
+    CallRequest call_request = 4;
+    CallResponse call_response = 5;
+    DiscoveryRequest discovery_request = 6;
+    DiscoveryResponse discovery_response = 7;
+  }
+}
+
+// 意图调用请求
+message CallRequest {
+  string request_id = 1;       // 调用 UUID
+  string caller_urn = 2;       // 调用方的 URN (例如 urn:hermes:agent:alice...)
+  string intent_name = 3;      // 请求调用的意图名 (例如 "calendar.book_event")
+  string arguments_json = 4;   // 调用的结构化参数 (符合 Intent Schema)
+  CapabilityToken token = 5;   // 携带的能力令牌，如果是链式授权的话
+}
+
+// 意图调用响应
+message CallResponse {
+  string request_id = 1;
+  bool success = 2;
+  int32 error_code = 3;        // 错误状态码 (e.g., 0=OK, 403=Forbidden, 500=ExecError)
+  string error_message = 4;
+  string result_json = 5;      // 调用结果 JSON
+}
+
+// 意图发现请求 (Capability Discovery)
+message DiscoveryRequest {
+  string request_id = 1;
+  string query_urn = 2;        // 发起查询的 URN
+  string category_filter = 3;  // 可选过滤分类 (e.g., "calendar", "files")
+}
+
+// 意图发现响应
+message DiscoveryResponse {
+  string request_id = 1;
+  repeated IntentMetadata intents = 2; // 允许该查询者调用的意图列表
+}
+
+// 意图元数据声明
+message IntentMetadata {
+  string name = 1;             // 意图名 (e.g., "calendar.query_availability")
+  string description = 2;      // 描述，供 LLM 理解作用
+  string input_schema_json = 3;// 符合 JSON Schema 规范的入参定义
+  string output_schema_json = 4;// 响应的 Schema 定义
+  bool requires_hitl = 5;      // 执行该意图是否默认需要宿主的人类确认
+}
+
+// 基于能力的授权令牌 (HCT - Capability Token)
+message CapabilityToken {
+  string issuer_urn = 1;       // 授权签发者
+  string audience_urn = 2;     // 被授权者
+  int64 expires_at = 3;        // 过期时间
+  repeated AllowedConstraint constraints = 4; // 限制规则
+  bytes signature = 5;         // 签发者对该 Token 的 Ed25519 签名
+}
+
+message AllowedConstraint {
+  string resource = 1;         // "file", "calendar", "command"
+  string action = 2;           // "read", "write", "execute"
+  repeated string filters = 3; // 限制性过滤，例如 "path=/workspace", "max_budget=0.50"
+}
