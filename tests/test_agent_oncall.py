@@ -309,7 +309,7 @@ def test_stdin_stdout_handler(keys, monkeypatch):
         {"type": "object"},
         lambda s, a: {"hello": "world"}
     )
-    alice.trust_db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_2_FRIEND)
+    alice.trust_db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_2_FRIEND, ["hello"])
 
     handler = StdinStdoutHandler(alice)
     
@@ -375,3 +375,109 @@ def test_stdin_stdout_handler(keys, monkeypatch):
     assert reply_envelope.discovery_response.request_id == "test-req-id"
     assert len(reply_envelope.discovery_response.intents) == 1
     assert reply_envelope.discovery_response.intents[0].name == "hello"
+
+
+def test_trust_db_json_serialization(keys, tmp_path):
+    db_file = tmp_path / "test_trust_db.json"
+    
+    # 1. Create and populate db
+    db = TrustDatabase(file_path=str(db_file))
+    db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_2_FRIEND, ["calendar.*"])
+    db.set_tier_permissions(TIER_3_STRANGER, ["info.*"])
+    
+    # 2. Reload in a new instance and verify
+    db2 = TrustDatabase(file_path=str(db_file))
+    assert db2.get_contact_trust_level("urn:hermes:agent:bob") == TIER_2_FRIEND
+    assert db2.get_contact_pubkey("urn:hermes:agent:bob") == keys["bob"][3]
+    assert db2.get_contact_allowed_intents("urn:hermes:agent:bob") == ["calendar.*"]
+    assert db2.tier_permissions[TIER_3_STRANGER] == ["info.*"]
+
+
+def test_urn_specific_permission_override(keys):
+    comm = MockCommAdapter()
+    
+    alice = AgentOnCall(
+        agent_urn="urn:hermes:agent:alice",
+        private_key_hex=keys["alice"][2],
+        comm_adapter=comm
+    )
+    comm.register_agent(alice.agent_urn, alice)
+    
+    alice.register_intent(
+        "calendar.query_availability",
+        "Query calendar",
+        {"type": "object"},
+        lambda s, a: {"available": True}
+    )
+    alice.register_intent(
+        "calendar.book_event",
+        "Book event",
+        {"type": "object"},
+        lambda s, a: {"booked": True}
+    )
+    
+    # Charlie is a Stranger, but gets a URN-specific override for query_availability
+    alice.trust_db.add_contact("urn:hermes:agent:charlie", keys["charlie"][3], TIER_3_STRANGER, ["calendar.query_availability"])
+    
+    charlie = AgentOnCall(
+        agent_urn="urn:hermes:agent:charlie",
+        private_key_hex=keys["charlie"][2],
+        comm_adapter=comm
+    )
+    comm.register_agent(charlie.agent_urn, charlie)
+    charlie.trust_db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_3_STRANGER)
+    
+    # 1. Charlie calls query_availability -> allowed due to URN override!
+    res = charlie.call_remote("urn:hermes:agent:alice", "calendar.query_availability", {})
+    assert res["success"] is True
+    assert res["result"]["available"] is True
+    
+    # 2. Charlie calls book_event -> blocked (override only covers query_availability)
+    res = charlie.call_remote("urn:hermes:agent:alice", "calendar.book_event", {})
+    assert res["success"] is False
+    assert "Denied" in res["error_message"]
+
+
+def test_wildcard_matching(keys):
+    comm = MockCommAdapter()
+    
+    alice = AgentOnCall(
+        agent_urn="urn:hermes:agent:alice",
+        private_key_hex=keys["alice"][2],
+        comm_adapter=comm
+    )
+    comm.register_agent(alice.agent_urn, alice)
+    
+    alice.register_intent(
+        "calendar.query",
+        "Query calendar",
+        {"type": "object"},
+        lambda s, a: {"success": True}
+    )
+    alice.register_intent(
+        "system.reboot",
+        "Reboot system",
+        {"type": "object"},
+        lambda s, a: {"success": True}
+    )
+    
+    # Setup Charlie as Stranger, with wildcard override for calendar.*
+    alice.trust_db.add_contact("urn:hermes:agent:charlie", keys["charlie"][3], TIER_3_STRANGER, ["calendar.*"])
+    
+    charlie = AgentOnCall(
+        agent_urn="urn:hermes:agent:charlie",
+        private_key_hex=keys["charlie"][2],
+        comm_adapter=comm
+    )
+    comm.register_agent(charlie.agent_urn, charlie)
+    charlie.trust_db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_3_STRANGER)
+    
+    # 1. Charlie calls calendar.query -> matches calendar.* -> allowed
+    res = charlie.call_remote("urn:hermes:agent:alice", "calendar.query", {})
+    assert res["success"] is True
+    
+    # 2. Charlie calls system.reboot -> does not match calendar.* -> blocked
+    res = charlie.call_remote("urn:hermes:agent:alice", "system.reboot", {})
+    assert res["success"] is False
+    assert "Denied" in res["error_message"]
+

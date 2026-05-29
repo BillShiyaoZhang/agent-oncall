@@ -97,3 +97,30 @@ stateDiagram-v2
     *   Requester 利用大模型（LLM Matcher）比对对端实际返回的 $r$ 与预期的 $rd$ 是否语义相似 (`match(r, rd)`)。
     *   **成功对齐**：若匹配成功，代表智能体已准确理解此服务的调用机制，将 $ps$ 正式保存为可用服务，并结束流程。
     *   **重试/失败机制**：若匹配失败（例如对端返回错误参数提示），Requester 将错误信息回传给 LLM 再次进行解释（重新调整 $q$ 和 $rd$），并重新发起请求。如果重试次数达到限制（$max\_attempts$），则宣告对齐失败，放弃接入。
+
+---
+
+## 🎯 4. 数据驱动的细粒度策略控制 (Data-Driven Policy Control & Wildcard Override)
+
+在评估调用方的安全策略时，`agent-oncall` 支持对每个独立智能体进行精细化的权限隔离，并提供灵活的通配符匹配规则。
+
+### 权限校验执行顺序
+
+当 Responder 收到调用方的 URN 后，按照以下顺序校验对端是否有权执行指定的 Intent（例如 `calendar.query`）：
+
+1.  **个体级权限特许 (URN Overrides)**：
+    *   首先检查 `contacts` 数据库中该特定 URN 下的 `allowed_intents`（允许的意图规则列表）。
+    *   如果该列表中包含此意图（或可匹配的通配符模式），则**直接放行**。这使得我们可以针对特定合作伙伴进行特许授权，而无须调整其全局信任级别。
+2.  **级别级权限匹配 (Global Tier Permissions)**：
+    *   如果个体无特许，则查询该 URN 的全局信任等级（默认未配对节点为 `Tier_3_Stranger`）。
+    *   查询该信任等级关联的 `tier_permissions` 意图匹配规则列表。
+    *   如果包含此意图（或可匹配的通配符模式），则**放行**。
+3.  **默认拒绝 (Default Deny)**：
+    *   若上述两项检查均不通过，则拦截调用，拒绝访问。
+
+### 通配符支持
+
+为了简化策略定义，策略匹配器支持以下通配符：
+- `*`：匹配所有意图。例如给 `Tier_1_Family` 配置 `["*"]`，将直接放行其全部意图调用。
+- `calendar.*`：前缀通配匹配。允许调用所有以 `calendar.` 开头的意图（如 `calendar.query`、`calendar.book_event`），但不允许调用 `system.reboot`。
+- 精确命名：例如 `calendar.query_availability`。只允许调用该指定的单一意图。

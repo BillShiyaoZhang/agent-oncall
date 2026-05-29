@@ -28,7 +28,6 @@ class IntentMetadata:
         self.resource = resource or name.split('.')[0]
         self.action = action or "execute"
 
-
 class AgentOnCall:
     def __init__(
         self,
@@ -38,12 +37,13 @@ class AgentOnCall:
         trust_db: Optional[TrustDatabase] = None,
         policy_engine: Optional[PolicyEngine] = None,
         hitl_handler: Optional[HITLHandler] = None,
-        clock_skew_tolerance: int = 300 # 5 minutes
+        clock_skew_tolerance: int = 300, # 5 minutes
+        trust_db_path: Optional[str] = None
     ):
         self.agent_urn = agent_urn
         self.private_key_hex = private_key_hex
         self.comm_adapter = comm_adapter
-        self.trust_db = trust_db or TrustDatabase()
+        self.trust_db = trust_db or TrustDatabase(trust_db_path)
         self.policy_engine = policy_engine or PolicyEngine()
         self.hitl_handler = hitl_handler or InteractiveHITLHandler()
         self.clock_skew_tolerance = clock_skew_tolerance

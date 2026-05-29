@@ -1,3 +1,5 @@
+import json
+import os
 import time
 from typing import Dict, List, Tuple, Optional
 from agent_oncall.pb import agent_oncall_pb2
@@ -8,16 +10,92 @@ TIER_1_FAMILY = "Tier_1_Family"
 TIER_2_FRIEND = "Tier_2_Friend"
 TIER_3_STRANGER = "Tier_3_Stranger"
 
-class TrustDatabase:
-    """In-memory database storing URN to public key and trust level mappings."""
-    def __init__(self):
-        self.contacts: Dict[str, Dict[str, str]] = {}
+def match_pattern(pattern: str, intent_name: str) -> bool:
+    """Matches an intent name against a wildcard pattern (e.g. '*' or 'calendar.*')."""
+    if pattern == "*":
+        return True
+    if pattern.endswith(".*"):
+        prefix = pattern[:-2]
+        return intent_name.startswith(prefix + ".")
+    return pattern == intent_name
 
-    def add_contact(self, urn: str, public_key_hex: str, trust_level: str = TIER_3_STRANGER):
+
+class TrustDatabase:
+    """File-driven trust database storing contacts, public keys, trust tiers, and allowed intents."""
+    def __init__(self, file_path: Optional[str] = None):
+        self.file_path = file_path
+        self.contacts: Dict[str, Dict] = {}
+        self.tier_permissions: Dict[str, List[str]] = {
+            TIER_1_FAMILY: ["*"],
+            TIER_2_FRIEND: ["calendar.query_availability"],
+            TIER_3_STRANGER: []
+        }
+        if self.file_path:
+            self.load()
+
+    def load(self):
+        """Loads contacts and tier permissions from the JSON file."""
+        if not self.file_path or not os.path.exists(self.file_path):
+            return
+        try:
+            with open(self.file_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                self.contacts = data.get("contacts", {})
+                self.tier_permissions = data.get("tier_permissions", self.tier_permissions)
+        except Exception as e:
+            # Fallback if parsing fails
+            pass
+
+    def save(self):
+        """Saves current state to the JSON file."""
+        if not self.file_path:
+            return
+        try:
+            # Ensure parent directories exist
+            parent_dir = os.path.dirname(self.file_path)
+            if parent_dir and not os.path.exists(parent_dir):
+                os.makedirs(parent_dir, exist_ok=True)
+                
+            data = {
+                "tier_permissions": self.tier_permissions,
+                "contacts": self.contacts
+            }
+            with open(self.file_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            pass
+
+    def add_contact(
+        self,
+        urn: str,
+        public_key_hex: str,
+        trust_level: str = TIER_3_STRANGER,
+        allowed_intents: Optional[List[str]] = None
+    ):
+        """Adds a contact with public key, trust level, and optional custom allowed intents."""
         self.contacts[urn] = {
             "public_key_hex": public_key_hex,
-            "trust_level": trust_level
+            "trust_level": trust_level,
+            "allowed_intents": allowed_intents or []
         }
+        self.save()
+
+    def remove_contact(self, urn: str):
+        """Removes a contact from the database."""
+        if urn in self.contacts:
+            del self.contacts[urn]
+            self.save()
+
+    def set_allowed_intents(self, urn: str, allowed_intents: List[str]):
+        """Sets URN-specific allowed intents override list."""
+        if urn in self.contacts:
+            self.contacts[urn]["allowed_intents"] = allowed_intents
+            self.save()
+
+    def set_tier_permissions(self, tier: str, allowed_intents: List[str]):
+        """Modifies the global allowed intents list for a specific trust tier."""
+        self.tier_permissions[tier] = allowed_intents
+        self.save()
 
     def get_contact_pubkey(self, urn: str) -> Optional[str]:
         contact = self.contacts.get(urn)
@@ -27,37 +105,38 @@ class TrustDatabase:
         contact = self.contacts.get(urn)
         return contact["trust_level"] if contact else TIER_3_STRANGER
 
+    def get_contact_allowed_intents(self, urn: str) -> List[str]:
+        contact = self.contacts.get(urn)
+        return contact.get("allowed_intents", []) if contact else []
+
     def is_trusted(self, urn: str) -> bool:
         return self.get_contact_trust_level(urn) in (TIER_1_FAMILY, TIER_2_FRIEND)
 
 
 class PolicyEngine:
-    """Evaluates access policies based on caller URN and Intent requirements."""
-    def __init__(self):
-        # Maps intent name to lists of allowed trust tiers
-        self.policies: Dict[str, List[str]] = {
-            "calendar.query_availability": [TIER_1_FAMILY, TIER_2_FRIEND],
-            "calendar.book_event": [TIER_1_FAMILY],
-        }
-        self.default_allowed_tiers = [TIER_1_FAMILY, TIER_2_FRIEND]
-
-    def register_policy(self, intent_name: str, allowed_tiers: List[str]):
-        """Allows registering custom policy requirements for an intent."""
-        self.policies[intent_name] = allowed_tiers
-
+    """Evaluates access policies based on URN overrides and trust level tier permissions."""
     def evaluate_policy(self, sender_urn: str, intent_name: str, trust_db: TrustDatabase) -> Tuple[bool, str]:
         """
-        Evaluates whether a sender is allowed to invoke an intent.
+        Evaluates whether a sender URN is allowed to invoke an intent.
+        Order of evaluation:
+        1. URN-specific overrides (allowed_intents list in contacts).
+        2. Global tier_permissions based on sender URN's trust level.
         Returns (allowed, reason).
         """
+        # 1. Check URN-specific overrides
+        allowed_intents = trust_db.get_contact_allowed_intents(sender_urn)
+        for pattern in allowed_intents:
+            if match_pattern(pattern, intent_name):
+                return True, f"Allowed by URN-specific permission override '{pattern}'"
+
+        # 2. Check Global Tier permissions
         trust_level = trust_db.get_contact_trust_level(sender_urn)
-        
-        allowed_tiers = self.policies.get(intent_name, self.default_allowed_tiers)
-        
-        if trust_level in allowed_tiers:
-            return True, f"Caller has trust level {trust_level} which is allowed"
-            
-        return False, f"Caller trust level {trust_level} is not in allowed tiers {allowed_tiers}"
+        tier_allowed_patterns = trust_db.tier_permissions.get(trust_level, [])
+        for pattern in tier_allowed_patterns:
+            if match_pattern(pattern, intent_name):
+                return True, f"Allowed by trust tier '{trust_level}' permission '{pattern}'"
+                
+        return False, f"Denied: Trust tier '{trust_level}' does not allow intent '{intent_name}'"
 
 
 def sign_capability_token(
@@ -80,8 +159,6 @@ def sign_capability_token(
         if "filters" in c_dict:
             constraint.filters.extend(c_dict["filters"])
             
-    # Serialize token excluding the signature field
-    # Protobuf oneof/signature is not yet set, we serialize the current state
     token_copy = agent_oncall_pb2.CapabilityToken()
     token_copy.CopyFrom(token)
     token_copy.signature = b""
@@ -91,7 +168,6 @@ def sign_capability_token(
     private_key = crypto.load_private_key_from_hex(private_key_hex)
     signature_hex = crypto.sign_payload(private_key, serialized_bytes)
     
-    # Store raw bytes of the signature (since the proto field signature is bytes)
     token.signature = bytes.fromhex(signature_hex)
     return token
 
@@ -104,10 +180,7 @@ def verify_capability_token(
     trust_db: TrustDatabase,
     current_time: Optional[float] = None
 ) -> Tuple[bool, str]:
-    """
-    Verifies the capability token structure, signature, and constraints.
-    Returns (valid, reason).
-    """
+    """Verifies CapabilityToken signatures and constraints."""
     if current_time is None:
         current_time = time.time()
         

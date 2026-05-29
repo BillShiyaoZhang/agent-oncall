@@ -263,6 +263,63 @@ def main():
     else:
         log_error(f"Call failed: {res['error_message']}")
 
+    log_section("6. FILE-DRIVEN TRUST DATABASE & CUSTOM OVERRIDES")
+    
+    import os
+    db_file_path = "demo_trust_db.json"
+    
+    log_info(f"Initializing a new agent Dave with a file-driven trust database: '{db_file_path}'")
+    dave_priv, dave_pub = crypto.generate_keypair()
+    dave_urn = "urn:hermes:agent:dave"
+    
+    # Initialize Dave with the JSON file path
+    dave = AgentOnCall(
+        agent_urn=dave_urn,
+        private_key_hex=crypto.private_key_to_hex(dave_priv),
+        comm_adapter=comm,
+        trust_db_path=db_file_path
+    )
+    
+    log_info("Configuring Dave's trust database rules...")
+    # 1. Customize tier permissions: Allow Tier_2_Friend to run hello.* and calendar.query
+    dave.trust_db.set_tier_permissions(TIER_2_FRIEND, ["hello.*", "calendar.query"])
+    # 2. Add contact Bob as a Friend
+    dave.trust_db.add_contact(bob_urn, bob_pub_hex, TIER_2_FRIEND)
+    # 3. Add contact Charlie as a Stranger but with a URN-specific override to run hello.world
+    dave.trust_db.add_contact(charlie_urn, charlie_pub_hex, TIER_3_STRANGER, ["hello.world"])
+    
+    log_success("Dave's trust database populated and auto-saved to JSON file.")
+    
+    # Read and print the JSON file content to show how easy it is to edit!
+    log_info("Reading generated trust_db.json file contents:")
+    with open(db_file_path, "r", encoding="utf-8") as f:
+        print(f.read().strip())
+        
+    # Verify policy matching works using the loaded file rules
+    log_info("Verifying policy matching with the newly populated DB rules:")
+    
+    # Register intents on Dave
+    dave.register_intent("hello.world", "Hello World", {"type": "object"}, lambda s, a: {"msg": "hello"})
+    dave.register_intent("calendar.query", "Query calendar", {"type": "object"}, lambda s, a: {"msg": "query"})
+    dave.register_intent("system.reboot", "Reboot system", {"type": "object"}, lambda s, a: {"msg": "reboot"})
+    
+    # Bob (Friend) calls hello.world -> matches hello.* pattern -> allowed
+    allowed, reason = dave.policy_engine.evaluate_policy(bob_urn, "hello.world", dave.trust_db)
+    log_info(f"  Bob calls hello.world -> Allowed: {allowed} ({reason})")
+    
+    # Charlie (Stranger) calls hello.world -> matches custom allowed override -> allowed
+    allowed, reason = dave.policy_engine.evaluate_policy(charlie_urn, "hello.world", dave.trust_db)
+    log_info(f"  Charlie calls hello.world -> Allowed: {allowed} ({reason})")
+    
+    # Charlie (Stranger) calls calendar.query -> not in overrides -> blocked
+    allowed, reason = dave.policy_engine.evaluate_policy(charlie_urn, "calendar.query", dave.trust_db)
+    log_info(f"  Charlie calls calendar.query -> Allowed: {allowed} ({reason})")
+    
+    # Clean up the demo trust database file
+    if os.path.exists(db_file_path):
+        os.remove(db_file_path)
+        log_info(f"Cleaned up temporary file: '{db_file_path}'")
+
     log_section("DEMO COMPLETED SUCCESSFULLY!")
 
 if __name__ == "__main__":
