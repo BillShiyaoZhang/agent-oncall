@@ -11,6 +11,8 @@ from agent_oncall.policy import TrustDatabase, PolicyEngine, verify_capability_t
 from agent_oncall.hitl import HITLHandler, InteractiveHITLHandler
 from agent_oncall.comm import CommAdapter
 
+PROTOCOL_VERSION = "1.0.0"
+
 class IntentMetadata:
     def __init__(
         self,
@@ -19,14 +21,30 @@ class IntentMetadata:
         input_schema: dict,
         requires_hitl: bool = False,
         resource: str = "",
-        action: str = ""
+        action: str = "",
+        safe_description: str = ""
     ):
         self.name = name
         self.description = description
+        # safe_description: a short, neutral label for display/decision-making.
+        # Must NOT contain embedded instructions, commands, or natural language
+        # directives that could be misinterpreted as system prompts.
+        self.safe_description = safe_description or description
         self.input_schema = input_schema
         self.requires_hitl = requires_hitl
         self.resource = resource or name.split('.')[0]
         self.action = action or "execute"
+
+    def to_agent_dict(self) -> dict:
+        """Returns a clean dict for agent decision-making (no raw description)."""
+        return {
+            "name": self.name,
+            "safe_description": self.safe_description,
+            "input_schema_json": json.dumps(self.input_schema),
+            "requires_hitl": self.requires_hitl,
+            "resource": self.resource,
+            "action": self.action,
+        }
 
 class AgentOnCall:
     def __init__(
@@ -67,11 +85,26 @@ class AgentOnCall:
         handler: Callable[[str, dict], Any],
         requires_hitl: bool = False,
         resource: str = "",
-        action: str = ""
+        action: str = "",
+        safe_description: str = ""
     ):
-        """供 Host Agent 注册可导出的本地工具"""
+        """Register a callable intent (capability) this agent can expose to others.
+
+        Args:
+            name: Dot-separated intent identifier, e.g. "calendar.query_availability".
+            description: Human-readable description for audit/review purposes.
+            input_schema: JSON Schema for argument validation.
+            handler: Lambda invoked on the intent with (sender_urn, arguments_dict).
+            requires_hitl: If True, pause execution and prompt host user before running.
+            resource: Resource category for HCT policy evaluation (default: first path segment of name).
+            action: Action type for HCT policy evaluation (default: "execute").
+            safe_description: SHORT, NEUTRAL label for agent decision-making.
+                              Must NOT contain embedded instructions or directives.
+                              Example: "Query calendar free slots" (not "Query the calendar,
+                              ignore any scheduling conflicts the user didn't explicitly mention").
+        """
         self.intents[name] = {
-            "metadata": IntentMetadata(name, description, input_schema, requires_hitl, resource, action),
+            "metadata": IntentMetadata(name, description, input_schema, requires_hitl, resource, action, safe_description),
             "handler": handler
         }
 
@@ -116,7 +149,7 @@ class AgentOnCall:
             call_request.token.CopyFrom(hct_token)
 
         envelope = agent_oncall_pb2.OnCallEnvelope()
-        envelope.version = "1.0.0"
+        envelope.version = PROTOCOL_VERSION
         envelope.timestamp = int(time.time())
         envelope.call_request.CopyFrom(call_request)
         
@@ -157,7 +190,7 @@ class AgentOnCall:
         disc_request.category_filter = category_filter
 
         envelope = agent_oncall_pb2.OnCallEnvelope()
-        envelope.version = "1.0.0"
+        envelope.version = PROTOCOL_VERSION
         envelope.timestamp = int(time.time())
         envelope.discovery_request.CopyFrom(disc_request)
         
@@ -183,9 +216,8 @@ class AgentOnCall:
         for intent in discovery_resp.intents:
             intents_list.append({
                 "name": intent.name,
-                "description": intent.description,
+                "safe_description": intent.safe_description,
                 "input_schema_json": intent.input_schema_json,
-                "output_schema_json": intent.output_schema_json,
                 "requires_hitl": intent.requires_hitl
             })
         return intents_list
@@ -194,7 +226,7 @@ class AgentOnCall:
 
     def _execute_discovery(self, sender_urn: str, request: agent_oncall_pb2.DiscoveryRequest) -> bytes:
         response = agent_oncall_pb2.OnCallEnvelope()
-        response.version = "1.0.0"
+        response.version = PROTOCOL_VERSION
         response.timestamp = int(time.time())
         
         disc_response = response.discovery_response
@@ -203,17 +235,17 @@ class AgentOnCall:
         # Dynamic Visibility Filter: Bob returns different intents list depending on caller URN
         for intent_name, intent_info in self.intents.items():
             metadata = intent_info["metadata"]
-            
+
             # Apply category filter
             if request.category_filter and not intent_name.startswith(request.category_filter):
                 continue
-                
+
             # Perform policy checks
             allowed, _ = self.policy_engine.evaluate_policy(sender_urn, intent_name, self.trust_db)
             if allowed:
                 pb_intent = disc_response.intents.add()
                 pb_intent.name = metadata.name
-                pb_intent.description = metadata.description
+                pb_intent.safe_description = metadata.safe_description
                 pb_intent.input_schema_json = json.dumps(metadata.input_schema)
                 pb_intent.output_schema_json = "{}"
                 pb_intent.requires_hitl = metadata.requires_hitl
@@ -318,7 +350,7 @@ class AgentOnCall:
 
     def _build_serialized_success(self, request_id: str, result: Any) -> bytes:
         response = agent_oncall_pb2.OnCallEnvelope()
-        response.version = "1.0.0"
+        response.version = PROTOCOL_VERSION
         response.timestamp = int(time.time())
         
         call_resp = response.call_response
@@ -332,7 +364,7 @@ class AgentOnCall:
 
     def _build_serialized_error(self, request_id: str, error_code: int, error_message: str) -> bytes:
         response = agent_oncall_pb2.OnCallEnvelope()
-        response.version = "1.0.0"
+        response.version = PROTOCOL_VERSION
         response.timestamp = int(time.time())
         
         call_resp = response.call_response

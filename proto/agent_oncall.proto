@@ -50,9 +50,10 @@ message DiscoveryResponse {
 // 意图元数据声明
 message IntentMetadata {
   string name = 1;             // 意图名 (e.g., "calendar.query_availability")
-  string description = 2;      // 描述，供 LLM 理解作用
+  string description = 2;      // 描述，供人类审查用
+  string safe_description = 6; // 简短中性标签，用于 agent 决策（不含指令）
   string input_schema_json = 3;// 符合 JSON Schema 规范的入参定义
-  string output_schema_json = 4;// 响应的 Schema 定义
+  string output_schema_json = 4;// 响应的 Schema 定义 (已废弃，保留字段序号)
   bool requires_hitl = 5;      // 执行该意图是否默认需要宿主的人类确认
 }
 

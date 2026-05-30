@@ -53,11 +53,34 @@ class MockCommAdapter(CommAdapter):
 
 class SubprocessCommAdapter(CommAdapter):
     """
-    Subprocess-based adapter that executes the compiled agent-comm binary.
+    Subprocess-based adapter that executes the agent-comm binary.
     Launches 'agent-comm listen' as a background daemon and parses stdout to receive envelopes.
+
+    The agent-comm binary is resolved in this order:
+    1. Path set via AGENT_COMM_PATH environment variable
+    2. 'agent-comm' found in PATH via shutil.which()
+    3. Fallback to a common installation location
+
+    Note: this adapter only handles raw base64-encoded envelope transport.
+    It does NOT know or care about the application-layer contents of the envelopes —
+    that is agent-oncall's job. agent-comm provides the secure transport channel
+    (Ed25519 identity, ECIES encryption, Double Ratchet, Relay v2).
     """
-    def __init__(self, agent_comm_path: str, keys_dir: Optional[str] = None, bootstrap_addr: Optional[str] = None):
-        self.agent_comm_path = agent_comm_path
+    def __init__(
+        self,
+        agent_comm_path: Optional[str] = None,
+        keys_dir: Optional[str] = None,
+        bootstrap_addr: Optional[str] = None
+    ):
+        import os, shutil
+
+        # Resolve binary path: env var > PATH lookup > fallback
+        self.agent_comm_path = (
+            os.environ.get("AGENT_COMM_PATH")
+            or shutil.which("agent-comm")
+            or agent_comm_path
+            or "/usr/local/bin/agent-comm"
+        )
         self.keys_dir = keys_dir
         self.bootstrap_addr = bootstrap_addr
         self.callback = None

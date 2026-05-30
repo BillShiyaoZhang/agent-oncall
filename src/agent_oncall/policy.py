@@ -80,6 +80,53 @@ class TrustDatabase:
         }
         self.save()
 
+    def add_contact_from_card(self, card_text: str, trust_level: str = TIER_3_STRANGER) -> Optional[str]:
+        """Parse an agent-comm contact card text block and add the contact.
+
+        Parses the ``-----BEGIN AGENT-COMM CONTACT CARD-----`` block embedded in
+        ``card_text`` and adds a contact entry using the extracted Ed25519 public key
+        (hex) and derived URN.
+
+        Returns the URN of the added contact, or None if the card could not be parsed.
+
+        Example usage after exchanging contact cards with agent-comm::
+
+            # Alice runs: agent-comm share  →  gets card_text
+            # Bob imports into agent-oncall:
+            urn = bob.trust_db.add_contact_from_card(card_text, TIER_2_FRIEND)
+        """
+        import re
+        # Extract the BASE64-encoded Ed25519PK from the card block
+        pattern = r"-----BEGIN AGENT-COMM CONTACT CARD-----\s*\n"
+        begin_idx = re.search(pattern, card_text)
+        if not begin_idx:
+            return None
+        start = begin_idx.end()
+        end_idx = card_text.find("-----END AGENT-COMM CONTACT CARD-----", start)
+        if end_idx < 0:
+            return None
+        block = card_text[start:end_idx]
+
+        ed25519_hex = None
+        for line in block.splitlines():
+            line = line.strip()
+            if line.startswith("Ed25519PK:"):
+                ed25519_hex = line.split(":", 1)[1].strip()
+                break
+
+        if not ed25519_hex or len(ed25519_hex) != 64:
+            return None
+
+        # Derive URN the same way agent-comm does: sha256(pk)[:16] → base58
+        import hashlib
+        import base58
+        pk_bytes = bytes.fromhex(ed25519_hex)
+        h = hashlib.sha256(pk_bytes).digest()[:16]
+        urn = f"urn:hermes:agent:{base58.encode(h)}"
+
+        self.add_contact(urn, ed25519_hex, trust_level)
+        return urn
+
     def remove_contact(self, urn: str):
         """Removes a contact from the database."""
         if urn in self.contacts:
