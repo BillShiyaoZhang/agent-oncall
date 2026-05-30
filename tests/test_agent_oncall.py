@@ -481,3 +481,509 @@ def test_wildcard_matching(keys):
     assert res["success"] is False
     assert "Denied" in res["error_message"]
 
+
+def test_crypto_errors(keys):
+    # Test verify_signature with invalid signatures/hex strings
+    _, pub = crypto.generate_keypair()
+    assert crypto.verify_signature(pub, b"test", "invalidhex") is False
+    assert crypto.verify_signature(pub, b"test", "ab") is False  # Too short
+    assert crypto.verify_signature(pub, b"test", "01" * 64) is False  # Wrong signature
+
+    # Test load_private_key_from_hex with invalid keys
+    with pytest.raises(Exception):
+        crypto.load_private_key_from_hex("invalidhex")
+    with pytest.raises(Exception):
+        crypto.load_private_key_from_hex("01" * 31)
+
+    with pytest.raises(Exception):
+        crypto.load_public_key_from_hex("invalidhex")
+    with pytest.raises(Exception):
+        crypto.load_public_key_from_hex("01" * 31)
+
+
+def test_match_pattern_unit():
+    from agent_oncall.policy import match_pattern
+    assert match_pattern("*", "any.intent") is True
+    assert match_pattern("calendar.*", "calendar.query") is True
+    assert match_pattern("calendar.*", "calendar.book") is True
+    assert match_pattern("calendar.*", "system.reboot") is False
+    assert match_pattern("exact.intent", "exact.intent") is True
+    assert match_pattern("exact.intent", "exact.intent.other") is False
+
+
+def test_trust_db_details(keys, tmp_path):
+    # Test load and save with no file path
+    db = TrustDatabase(file_path=None)
+    db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_2_FRIEND)
+    # Should not crash and should update in memory
+    assert db.get_contact_trust_level("urn:hermes:agent:bob") == TIER_2_FRIEND
+    db.save()
+    db.load()
+    
+    # Test file-based database loading invalid JSON
+    bad_db_file = tmp_path / "bad_trust_db.json"
+    with open(bad_db_file, "w", encoding="utf-8") as f:
+        f.write("{invalid json}")
+        
+    db_bad = TrustDatabase(file_path=str(bad_db_file))
+    # Should load fallback defaults and not crash
+    assert db_bad.contacts == {}
+    
+    # Test remove_contact
+    db.remove_contact("urn:hermes:agent:bob")
+    assert db.get_contact_trust_level("urn:hermes:agent:bob") == TIER_3_STRANGER
+    
+    # Test is_trusted
+    assert db.is_trusted("urn:hermes:agent:alice") is False # Alice not added
+    db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_1_FAMILY)
+    assert db.is_trusted("urn:hermes:agent:alice") is True
+    db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_3_STRANGER)
+    assert db.is_trusted("urn:hermes:agent:alice") is False
+
+
+def test_verify_capability_token_errors(keys):
+    # Create valid token first
+    db = TrustDatabase(file_path=None)
+    db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_1_FAMILY)
+    db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_2_FRIEND)
+
+    # 1. Expired token
+    expired_token = sign_capability_token(
+        private_key_hex=keys["alice"][2],
+        issuer_urn="urn:hermes:agent:alice",
+        audience_urn="urn:hermes:agent:bob",
+        expires_in_seconds=-10,
+        constraints=[{"resource": "calendar", "action": "write"}]
+    )
+    allowed, reason = verify_capability_token(
+        expired_token, "urn:hermes:agent:bob", "calendar", "write", db
+    )
+    assert allowed is False
+    assert "expired" in reason
+
+    # 2. Audience mismatch
+    token = sign_capability_token(
+        private_key_hex=keys["alice"][2],
+        issuer_urn="urn:hermes:agent:alice",
+        audience_urn="urn:hermes:agent:bob",
+        expires_in_seconds=60,
+        constraints=[{"resource": "calendar", "action": "write"}]
+    )
+    allowed, reason = verify_capability_token(
+        token, "urn:hermes:agent:charlie", "calendar", "write", db
+    )
+    assert allowed is False
+    assert "audience" in reason
+
+    # 3. Unregistered issuer
+    token_unreg = sign_capability_token(
+        private_key_hex=keys["charlie"][2],
+        issuer_urn="urn:hermes:agent:charlie",
+        audience_urn="urn:hermes:agent:bob",
+        expires_in_seconds=60,
+        constraints=[{"resource": "calendar", "action": "write"}]
+    )
+    allowed, reason = verify_capability_token(
+        token_unreg, "urn:hermes:agent:bob", "calendar", "write", db
+    )
+    assert allowed is False
+    assert "not in trust database" in reason
+
+    # 4. Signature validation failure
+    bad_sig_token = sign_capability_token(
+        private_key_hex=keys["alice"][2],
+        issuer_urn="urn:hermes:agent:alice",
+        audience_urn="urn:hermes:agent:bob",
+        expires_in_seconds=60,
+        constraints=[{"resource": "calendar", "action": "write"}]
+    )
+    # Modify signature
+    bad_sig_token.signature = b"0" * 64
+    allowed, reason = verify_capability_token(
+        bad_sig_token, "urn:hermes:agent:bob", "calendar", "write", db
+    )
+    assert allowed is False
+    assert "Signature verification failed" in reason or "Token signature verification failed" in reason
+
+    # 5. Mismatched constraints
+    allowed, reason = verify_capability_token(
+        token, "urn:hermes:agent:bob", "calendar", "read", db
+    )
+    assert allowed is False
+    assert "Constraints do not allow" in reason
+
+    allowed, reason = verify_capability_token(
+        token, "urn:hermes:agent:bob", "files", "write", db
+    )
+    assert allowed is False
+    assert "Constraints do not allow" in reason
+
+    # 6. Wildcard resource constraint
+    wildcard_token = sign_capability_token(
+        private_key_hex=keys["alice"][2],
+        issuer_urn="urn:hermes:agent:alice",
+        audience_urn="urn:hermes:agent:bob",
+        expires_in_seconds=60,
+        constraints=[{"resource": "*", "action": "write"}]
+    )
+    allowed, reason = verify_capability_token(
+        wildcard_token, "urn:hermes:agent:bob", "calendar", "write", db
+    )
+    assert allowed is True
+
+    # 7. Wildcard action constraint
+    wildcard_token2 = sign_capability_token(
+        private_key_hex=keys["alice"][2],
+        issuer_urn="urn:hermes:agent:alice",
+        audience_urn="urn:hermes:agent:bob",
+        expires_in_seconds=60,
+        constraints=[{"resource": "calendar", "action": "*"}]
+    )
+    allowed, reason = verify_capability_token(
+        wildcard_token2, "urn:hermes:agent:bob", "calendar", "read", db
+    )
+    assert allowed is True
+
+
+def test_interactive_hitl_handler(monkeypatch):
+    # Test default response
+    handler = InteractiveHITLHandler(default_response=True)
+    assert handler.approve_call("urn:bob", "calendar.book", "{}") is True
+
+    handler_refuse = InteractiveHITLHandler(default_response=False)
+    assert handler_refuse.approve_call("urn:bob", "calendar.book", "{}") is False
+
+    # Test console input approval
+    handler_interactive = InteractiveHITLHandler(default_response=None)
+    monkeypatch.setattr("builtins.input", lambda prompt: "y")
+    assert handler_interactive.approve_call("urn:bob", "calendar.book", "{}") is True
+
+    monkeypatch.setattr("builtins.input", lambda prompt: "n")
+    assert handler_interactive.approve_call("urn:bob", "calendar.book", "{}") is False
+
+    # Test KeyboardInterrupt / EOFError handling
+    def mock_input_interrupt(prompt):
+        raise KeyboardInterrupt()
+    monkeypatch.setattr("builtins.input", mock_input_interrupt)
+    assert handler_interactive.approve_call("urn:bob", "calendar.book", "{}") is False
+
+
+def test_subprocess_comm_adapter(keys, monkeypatch):
+    from agent_oncall.comm import SubprocessCommAdapter
+    adapter = SubprocessCommAdapter("/bin/agent-comm", keys_dir="/tmp/keys", bootstrap_addr="127.0.0.1:4000")
+    
+    # Test _get_base_args
+    args = adapter._get_base_args()
+    assert args == ["/bin/agent-comm", "--keysdir", "/tmp/keys", "--bootstrap", "127.0.0.1:4000"]
+
+    # Test send_message command arguments
+    mock_run_args = None
+    class MockCompletedProcess:
+        def __init__(self, returncode, stderr=""):
+            self.returncode = returncode
+            self.stderr = stderr
+            
+    def mock_subprocess_run(cmd, capture_output, text):
+        nonlocal mock_run_args
+        mock_run_args = cmd
+        return MockCompletedProcess(returncode=0)
+        
+    monkeypatch.setattr("subprocess.run", mock_subprocess_run)
+    adapter.send_message("urn:hermes:agent:alice", b"test envelope bytes")
+    
+    assert mock_run_args is not None
+    assert "/bin/agent-comm" in mock_run_args
+    assert "send" in mock_run_args
+    assert "urn:hermes:agent:alice" in mock_run_args
+    # Verify base64 message content
+    base64_payload = base64.b64encode(b"test envelope bytes").decode('utf-8')
+    assert base64_payload in mock_run_args
+
+    # Test send_message failure raising RuntimeError
+    def mock_subprocess_run_fail(cmd, capture_output, text):
+        return MockCompletedProcess(returncode=1, stderr="Failed to connect to peer")
+    monkeypatch.setattr("subprocess.run", mock_subprocess_run_fail)
+    with pytest.raises(RuntimeError) as exc_info:
+        adapter.send_message("urn:hermes:agent:alice", b"test envelope bytes")
+    assert "Failed to connect to peer" in str(exc_info.value)
+
+    # Test listen background Popen and parsing
+    class MockStdout:
+        def __init__(self, lines):
+            self.lines = lines
+            self.index = 0
+        def readline(self):
+            if self.index < len(self.lines):
+                val = self.lines[self.index]
+                self.index += 1
+                return val
+            return ""
+            
+    class MockPopen:
+        def __init__(self, cmd, stdout, stderr, text, bufsize):
+            self.stdout = MockStdout([
+                "[urn:hermes:agent:bob] 💬 " + base64.b64encode(b"envelope1").decode('utf-8') + "\n",
+                "from urn:hermes:agent:bob: \" " + base64.b64encode(b"envelope2").decode('utf-8') + "\"\n",
+                "\n"
+            ])
+        def terminate(self):
+            pass
+        def wait(self, timeout=None):
+            pass
+            
+    monkeypatch.setattr("subprocess.Popen", MockPopen)
+    
+    callback_calls = []
+    def mock_callback(sender, data):
+        callback_calls.append((sender, data))
+        return b"reply_bytes"
+        
+    adapter.register_receive_callback(mock_callback)
+    
+    # We must also mock adapter.send_message to capture replies
+    sent_replies = []
+    def mock_send_message(target_urn, envelope_bytes):
+        sent_replies.append((target_urn, envelope_bytes))
+    monkeypatch.setattr(adapter, "send_message", mock_send_message)
+    
+    adapter.start()
+    time.sleep(0.1) # Wait for thread to run
+    adapter.stop()
+    
+    assert len(callback_calls) >= 1
+    # Check that we parsed the sender URN and payload correctly
+    assert callback_calls[0][0] == "urn:hermes:agent:bob"
+    assert callback_calls[0][1] == b"envelope1"
+    # Verification of sending response back
+    assert len(sent_replies) >= 1
+    assert sent_replies[0] == ("urn:hermes:agent:bob", b"reply_bytes")
+
+
+def test_stdin_stdout_handler_errors(keys, monkeypatch):
+    from agent_oncall import AgentOnCall, MockCommAdapter
+    comm = MockCommAdapter()
+    alice = AgentOnCall(
+        agent_urn="urn:hermes:agent:alice",
+        private_key_hex=keys["alice"][2],
+        comm_adapter=comm
+    )
+    handler = StdinStdoutHandler(alice)
+    
+    stdout_mock = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", stdout_mock)
+    
+    # 1. Invalid JSON format on stdin
+    stdin_mock = io.StringIO("invalid json string\n")
+    monkeypatch.setattr(sys, "stdin", stdin_mock)
+    handler.run_loop()
+    assert "Invalid JSON format" in stdout_mock.getvalue()
+    
+    # 2. Unsupported event type
+    stdout_mock.truncate(0)
+    stdout_mock.seek(0)
+    stdin_mock = io.StringIO('{"event": "other_event"}\n')
+    monkeypatch.setattr(sys, "stdin", stdin_mock)
+    handler.run_loop()
+    assert "Unsupported event type" in stdout_mock.getvalue()
+
+    # 3. Missing keys
+    stdout_mock.truncate(0)
+    stdout_mock.seek(0)
+    stdin_mock = io.StringIO('{"event": "message_received", "sender_urn": "urn:bob"}\n')
+    monkeypatch.setattr(sys, "stdin", stdin_mock)
+    handler.run_loop()
+    assert "Missing sender_urn or payload_base64" in stdout_mock.getvalue()
+
+    # 4. Bad Base64 payload
+    stdout_mock.truncate(0)
+    stdout_mock.seek(0)
+    stdin_mock = io.StringIO('{"event": "message_received", "sender_urn": "urn:bob", "payload_base64": "invalid_base64!!!"}\n')
+    monkeypatch.setattr(sys, "stdin", stdin_mock)
+    handler.run_loop()
+    assert "Base64 decoding failed" in stdout_mock.getvalue()
+
+    # 5. Core handler throwing exception (invalid envelope bytes parse fail)
+    stdout_mock.truncate(0)
+    stdout_mock.seek(0)
+    stdin_mock = io.StringIO('{"event": "message_received", "sender_urn": "urn:bob", "payload_base64": "AAAA"}\n')
+    monkeypatch.setattr(sys, "stdin", stdin_mock)
+    handler.run_loop()
+    # The agent handle_incoming_envelope_bytes will catch pb parse error and return error envelope bytes,
+    # so we should get a "send_reply" containing the parsed error envelope rather than an "error" event.
+    assert "send_reply" in stdout_mock.getvalue()
+
+
+def test_agent_oncall_core_errors(keys, monkeypatch):
+    comm = MockCommAdapter()
+    
+    # 1. Clock skew test
+    alice = AgentOnCall(
+        agent_urn="urn:hermes:agent:alice",
+        private_key_hex=keys["alice"][2],
+        comm_adapter=comm,
+        clock_skew_tolerance=10 # very short tolerance
+    )
+    comm.register_agent(alice.agent_urn, alice)
+    alice.trust_db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_1_FAMILY)
+    alice.register_intent(
+        "calendar.query_availability",
+        "Query calendar",
+        {"type": "object"},
+        lambda s, a: {"available": True}
+    )
+
+    bob = AgentOnCall(
+        agent_urn="urn:hermes:agent:bob",
+        private_key_hex=keys["bob"][2],
+        comm_adapter=comm
+    )
+    comm.register_agent(bob.agent_urn, bob)
+    bob.trust_db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_1_FAMILY)
+
+    # Modify Bob's message timestamp to be far in the past
+    from agent_oncall.pb import agent_oncall_pb2
+    envelope = agent_oncall_pb2.OnCallEnvelope()
+    envelope.version = "1.0.0"
+    envelope.timestamp = int(time.time()) - 100 # skewed
+    
+    disc = envelope.discovery_request
+    disc.request_id = "test-skew-id"
+    disc.query_urn = bob.agent_urn
+    bob._sign_envelope(envelope)
+    
+    reply_bytes = alice.handle_incoming_envelope_bytes(bob.agent_urn, envelope.SerializeToString())
+    reply_envelope = agent_oncall_pb2.OnCallEnvelope()
+    reply_envelope.ParseFromString(reply_bytes)
+    
+    assert reply_envelope.WhichOneof("payload") == "call_response"
+    assert reply_envelope.call_response.success is False
+    assert "Timestamp expired/skewed" in reply_envelope.call_response.error_message
+
+    # 2. Async Call Remote response (None return)
+    class AsyncCommMock(MockCommAdapter):
+        def send_message(self, target_urn, envelope_bytes):
+            return None # Simulated async fire-and-forget
+            
+    async_comm = AsyncCommMock()
+    bob_async = AgentOnCall(
+        agent_urn="urn:hermes:agent:bob",
+        private_key_hex=keys["bob"][2],
+        comm_adapter=async_comm
+    )
+    res = bob_async.call_remote("urn:hermes:agent:alice", "calendar.query_availability", {"date": "2026-06-01"})
+    assert res["success"] is False
+    assert "Message sent asynchronously" in res["error_message"]
+
+    # 3. Bad signature on response
+    class BadResponseCommMock(MockCommAdapter):
+        def register_agent(self, urn, agent_instance):
+            self.agent = agent_instance
+        def send_message(self, target_urn, envelope_bytes):
+            # Intercept reply and modify it to have bad signature
+            actual_reply = self.agent.handle_incoming_envelope_bytes("urn:hermes:agent:bob", envelope_bytes)
+            reply_env = agent_oncall_pb2.OnCallEnvelope()
+            reply_env.ParseFromString(actual_reply)
+            reply_env.signature = "0" * 64
+            return reply_env.SerializeToString()
+            
+    bad_comm = BadResponseCommMock()
+    alice_bad = AgentOnCall(
+        agent_urn="urn:hermes:agent:alice",
+        private_key_hex=keys["alice"][2],
+        comm_adapter=bad_comm
+    )
+    bad_comm.register_agent(alice_bad.agent_urn, alice_bad)
+    alice_bad.trust_db.add_contact("urn:hermes:agent:bob", keys["bob"][3], TIER_1_FAMILY)
+    
+    bob_bad = AgentOnCall(
+        agent_urn="urn:hermes:agent:bob",
+        private_key_hex=keys["bob"][2],
+        comm_adapter=bad_comm
+    )
+    bob_bad.trust_db.add_contact("urn:hermes:agent:alice", keys["alice"][3], TIER_1_FAMILY)
+
+    res = bob_bad.call_remote("urn:hermes:agent:alice", "calendar.query_availability", {"date": "2026-06-01"})
+    assert res["success"] is False
+    assert "Response signature verification failed" in res["error_message"]
+
+    # 4. Core Intent Exception handling
+    def crashy_handler(sender, args):
+        raise ValueError("Simulated crash")
+        
+    alice.register_intent("calendar.crash", "Crash test", {"type": "object"}, crashy_handler)
+    res = bob.call_remote("urn:hermes:agent:alice", "calendar.crash", {})
+    assert res["success"] is False
+    assert "Execution failed: Simulated crash" in res["error_message"]
+
+    # 5. Schema verification errors
+    # Malformed JSON args string
+    call_req = agent_oncall_pb2.CallRequest()
+    call_req.request_id = "schema-err-id"
+    call_req.caller_urn = bob.agent_urn
+    call_req.intent_name = "calendar.query_availability"
+    call_req.arguments_json = "{bad json"
+    
+    envelope_bad_args = agent_oncall_pb2.OnCallEnvelope()
+    envelope_bad_args.version = "1.0.0"
+    envelope_bad_args.timestamp = int(time.time())
+    envelope_bad_args.call_request.CopyFrom(call_req)
+    bob._sign_envelope(envelope_bad_args)
+    
+    reply_bytes = alice.handle_incoming_envelope_bytes(bob.agent_urn, envelope_bad_args.SerializeToString())
+    reply_envelope = agent_oncall_pb2.OnCallEnvelope()
+    reply_envelope.ParseFromString(reply_bytes)
+    assert reply_envelope.call_response.success is False
+    assert "Arguments payload is not valid JSON" in reply_envelope.call_response.error_message
+
+    # 6. Category filtering when discovering intents
+    alice.register_intent("info.hello", "Hello info", {"type": "object"}, lambda s, a: {})
+    disc_list_all = bob.discover_remote(alice.agent_urn)
+    assert "calendar.query_availability" in [x["name"] for x in disc_list_all]
+    assert "info.hello" in [x["name"] for x in disc_list_all]
+
+    disc_list_filtered = bob.discover_remote(alice.agent_urn, category_filter="calendar")
+    assert "calendar.query_availability" in [x["name"] for x in disc_list_filtered]
+    assert "info.hello" not in [x["name"] for x in disc_list_filtered]
+
+
+def test_sda_alignment_errors():
+    # 1. Aligner raising an exception transitions SDA to FAILED state
+    def failing_aligner(description, history):
+        raise RuntimeError("LLM offline")
+        
+    sda = ServiceDescriptionAlignment(
+        ds="ambiguous description",
+        target_urn="urn:bob",
+        aligner_cb=failing_aligner,
+        matcher_cb=lambda r, rd: False
+    )
+    
+    assert sda.state == AlignmentState.INIT
+    req = sda.start_alignment()
+    assert req is None
+    assert sda.state == AlignmentState.FAILED
+
+    # 2. Exceeding max_attempts transitions SDA to FAILED state
+    def mock_aligner(description, history):
+        return "profile", "query", "expected"
+        
+    sda_retry = ServiceDescriptionAlignment(
+        ds="ambiguous description",
+        target_urn="urn:bob",
+        aligner_cb=mock_aligner,
+        matcher_cb=lambda r, rd: False, # Always mismatch
+        max_attempts=2
+    )
+    
+    sda_retry.start_alignment() # attempts = 0, state = WAITING_FOR_RESPONSE
+    finished, next_req = sda_retry.handle_response("wrong_response_1")
+    assert finished is False
+    assert next_req == "query"
+    assert sda_retry.state == AlignmentState.WAITING_FOR_RESPONSE
+    
+    finished2, next_req2 = sda_retry.handle_response("wrong_response_2")
+    assert finished2 is False
+    assert next_req2 is None
+    assert sda_retry.state == AlignmentState.FAILED
+    assert sda_retry.attempts == 2
+
